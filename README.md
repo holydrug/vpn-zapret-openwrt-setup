@@ -1,3 +1,6 @@
+<img width="972" height="1006" alt="{2B09AAC5-1E2D-48F0-99E2-45941BB9E93C}" src="https://github.com/user-attachments/assets/ee2bdf6b-b50e-43d2-a7c0-d0e2d5facd49" />
+
+
 # Cudy WR3000 OpenWrt Setup
 
 Автоматическая настройка Cudy WR3000 (MT7981) на OpenWrt 24.x с sing-box VPN, zapret (DPI bypass) и веб-панелью управления.
