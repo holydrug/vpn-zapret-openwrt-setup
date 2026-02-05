@@ -7,7 +7,7 @@ NAMES_FILE="/etc/device_names.json"
 TPROXY_PORT="12345"
 
 # Read VPN_SERVER from sing-box config
-VPN_SERVER=$(grep -o '"server"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/sing-box/config_full_vpn.json | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
+VPN_SERVER=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' /etc/sing-box/config_full_vpn.json | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"$//')
 
 get_tproxy_port() {
     case "$1" in
@@ -128,16 +128,16 @@ apply_vpn_off() {
 
 apply_zapret_off() {
     local m="$1"
-    nft list chain inet proxy_route forward_zapret 2>/dev/null | grep -q "ether saddr $m return" && return 0
-    nft insert rule inet proxy_route forward_zapret ether saddr "$m" return 2>/dev/null
+    nft -a list chain inet proxy_route forward_zapret 2>/dev/null | grep "ether saddr $m" | grep "accept" | \
+        awk '{print $NF}' | while read handle; do
+            nft delete rule inet proxy_route forward_zapret handle "$handle" 2>/dev/null
+        done
 }
 
 apply_zapret_on() {
     local m="$1"
-    nft -a list chain inet proxy_route forward_zapret 2>/dev/null | grep "ether saddr $m" | grep "return" | \
-        awk '{print $NF}' | while read handle; do
-            nft delete rule inet proxy_route forward_zapret handle "$handle" 2>/dev/null
-        done
+    nft list chain inet proxy_route forward_zapret 2>/dev/null | grep "ether saddr $m" | grep -q "accept" && return 0
+    nft insert rule inet proxy_route forward_zapret ether saddr "$m" accept 2>/dev/null
 }
 
 # Handle actions
@@ -191,7 +191,7 @@ if valid_mac "$mac" && [ -n "$action" ]; then
         delete_device)
             apply_vpn_off "$mac"
             remove_bypass "$mac"
-            apply_zapret_on "$mac"
+            apply_zapret_off "$mac"
             sed -i "s/\"$mac\":{[^}]*},\?//g; s/,}/}/g; s/{,/{/g" "$STATE_FILE"
             sed -i "s/\"$mac\":\"[^\"]*\",\?//g; s/,}/}/g; s/{,/{/g" "$NAMES_FILE"
             ;;
@@ -218,7 +218,7 @@ devices=$(get_devices | awk '!seen[$1]++ {print}')
 nft_rules=$(nft list chain ip proxy_tproxy prerouting 2>/dev/null)
 nft_vpn_macs=$(echo "$nft_rules" | grep "tproxy" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
 nft_bypass_macs=$(echo "$nft_rules" | grep -v "tproxy" | grep "ether saddr" | grep "accept" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
-nft_zapret_skip=$(nft list chain inet proxy_route forward_zapret 2>/dev/null | grep "return" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
+nft_zapret_on=$(nft list chain inet proxy_route forward_zapret 2>/dev/null | grep "accept" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
 has_catchall=$(echo "$nft_rules" | grep "tproxy" | grep -v "ether saddr" | grep -c "br-lan")
 
 # --- HTML output ---
@@ -344,8 +344,8 @@ echo "$devices" | while read mac ip dhcp_name; do
         vpn_st="false"
     fi
 
-    zapret_st="true"
-    echo "$nft_zapret_skip" | grep -qi "$mac" && zapret_st="false"
+    zapret_st="false"
+    echo "$nft_zapret_on" | grep -qi "$mac" && zapret_st="true"
 
     dev_preset=$(get_preset_state "$mac")
     [ -z "$dev_preset" ] && dev_preset="global_except_ru"
@@ -408,7 +408,7 @@ EOF
 done
 
 cat <<'HTMLFOOT'
-<div class="footer">VPN/Zapret Manager | Default: VPN ON (Global -RU)</div>
+<div class="footer">VPN/Zapret Manager | Default: VPN ON (Global -RU), DPI OFF</div>
 </body>
 </html>
 HTMLFOOT

@@ -172,7 +172,7 @@ TPROXY_PORT="12345"
 DEFAULT_VPN_PORT="12346"
 
 start_service() {
-    VPN_SERVER=$(grep -o '"server"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
+    VPN_SERVER=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
     [ -z "$VPN_SERVER" ] && { logger -t proxy-routing "No VPN_SERVER found, aborting"; return 1; }
 
     # Create nftables tables and chains
@@ -197,16 +197,14 @@ start_service() {
 
 stop_service() {
     nft flush chain ip proxy_tproxy prerouting 2>/dev/null
-    nft -a list chain inet proxy_route forward_zapret 2>/dev/null | grep "return" | grep "ether saddr" | awk '{print $NF}' | while read handle; do
-        nft delete rule inet proxy_route forward_zapret handle "$handle" 2>/dev/null
-    done
+    nft flush chain inet proxy_route forward_zapret 2>/dev/null
     ip rule del fwmark 1 lookup 100 2>/dev/null
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
     logger -t proxy-routing "proxy-routing stopped"
 }
 
 restore_state() {
-    VPN_SERVER=$(grep -o '"server"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
+    VPN_SERVER=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
 
     [ -f "$STATE_FILE" ] || {
         add_catchall
@@ -238,8 +236,8 @@ restore_state() {
                 iifname "br-lan" ether saddr "$mac" accept 2>/dev/null
         fi
 
-        if [ "$zapret_val" = "false" ]; then
-            nft insert rule inet proxy_route forward_zapret ether saddr "$mac" return 2>/dev/null
+        if [ "$zapret_val" = "true" ]; then
+            nft insert rule inet proxy_route forward_zapret ether saddr "$mac" accept 2>/dev/null
         fi
     done
 
@@ -247,7 +245,7 @@ restore_state() {
 }
 
 add_catchall() {
-    VPN_SERVER=$(grep -o '"server"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
+    VPN_SERVER=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
 
     nft add rule ip proxy_tproxy prerouting \
         iifname "br-lan" \
@@ -258,6 +256,10 @@ add_catchall() {
         ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
         meta l4proto udp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
     logger -t proxy-routing "Catch-all VPN (port $DEFAULT_VPN_PORT, global_except_ru) enabled"
+
+    # Catch-all: zapret OFF for unknown devices
+    nft add rule inet proxy_route forward_zapret iifname "br-lan" return 2>/dev/null
+    logger -t proxy-routing "Catch-all zapret OFF (return) enabled"
 }
 INITEOF
 chmod +x /etc/init.d/proxy-routing

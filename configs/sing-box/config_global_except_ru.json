@@ -64,6 +64,12 @@
       "tag": "direct"
     }
   ],
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "/tmp/sing-box-cache-global.db"
+    }
+  },
   "route": {
     "rules": [
       {
