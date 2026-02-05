@@ -6,7 +6,7 @@ STATE_FILE="/etc/vpn_state.json"
 NAMES_FILE="/etc/device_names.json"
 TPROXY_PORT="12345"
 
-# Читаем VPN_SERVER из конфига sing-box
+# Read VPN_SERVER from sing-box config
 VPN_SERVER=$(grep -o '"server"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/sing-box/config_full_vpn.json | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
 
 get_tproxy_port() {
@@ -55,11 +55,11 @@ get_preset_state() {
     grep -o "\"$1\"[^}]*" "$STATE_FILE" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4
 }
 get_device_name() {
-    grep -o "\"$1\":\"[^\"]*\"" "$NAMES_FILE" | head -1 | sed 's/.*:\"//; s/\"$//'
+    grep -o "\"$1\":\"[^\"]*\"" "$NAMES_FILE" | head -1 | sed 's/.*:"//; s/"$//'
 }
 set_device_name() {
     local m="$1" n="$2"
-    local tmp=$(sed "s/\"$m\":\"[^\"]*\",\\?//g; s/,}/}/g; s/{,/{/g" "$NAMES_FILE" | tr -d '\n' | sed 's/[[:space:]]//g')
+    local tmp=$(sed "s/\"$m\":\"[^\"]*\",\?//g; s/,}/}/g; s/{,/{/g" "$NAMES_FILE" | tr -d '\n' | sed 's/[[:space:]]//g')
     [ "$tmp" = "{}" ] && tmp=""
     if [ -z "$tmp" ] || [ "$tmp" = "{}" ]; then
         echo "{\"$m\":\"$n\"}" > "$NAMES_FILE"
@@ -69,8 +69,8 @@ set_device_name() {
 }
 set_state() {
     local m="$1" vpn="$2" zapret="$3" routing="$4"
-    [ -z "$routing" ] && routing="full_vpn"
-    local tmp=$(sed "s/\"$m\":{[^}]*},\\?//g; s/,}/}/g; s/{,/{/g" "$STATE_FILE" | tr -d '\n' | sed 's/[[:space:]]//g')
+    [ -z "$routing" ] && routing="global_except_ru"
+    local tmp=$(sed "s/\"$m\":{[^}]*},\?//g; s/,}/}/g; s/{,/{/g" "$STATE_FILE" | tr -d '\n' | sed 's/[[:space:]]//g')
     [ "$tmp" = "{}" ] && tmp=""
     if [ -z "$tmp" ] || [ "$tmp" = "{}" ]; then
         echo "{\"$m\":{\"vpn\":$vpn,\"zapret\":$zapret,\"routing\":\"$routing\"}}" > "$STATE_FILE"
@@ -81,27 +81,49 @@ set_state() {
 
 # ===== NFT RULES (real tables) =====
 
-apply_vpn_on() {
-    local m="$1"
-    local port="${2:-$TPROXY_PORT}"
-    nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -q "ether saddr $m" && return 0
-    nft add rule ip proxy_tproxy prerouting \
-        iifname "br-lan" ether saddr "$m" \
-        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
-        meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
-    nft add rule ip proxy_tproxy prerouting \
-        iifname "br-lan" ether saddr "$m" \
-        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
-        meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
-}
-
-apply_vpn_off() {
+# Remove accept bypass rules for a MAC (non-tproxy accept rules)
+remove_bypass() {
     local m="$1"
     nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
-        tr '\n' ' ' | grep -oE "ether saddr $m[^#]*# handle [0-9]+" | \
+        grep "ether saddr $m" | grep -v "tproxy" | grep "accept" | \
         grep -oE 'handle [0-9]+' | awk '{print $2}' | while read handle; do
             nft delete rule ip proxy_tproxy prerouting handle "$handle" 2>/dev/null
         done
+}
+
+# Add accept bypass rule (so catch-all does not apply)
+add_bypass() {
+    local m="$1"
+    nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $m" | grep -v "tproxy" | grep -q "accept" && return 0
+    nft insert rule ip proxy_tproxy prerouting \
+        iifname "br-lan" ether saddr "$m" accept 2>/dev/null
+}
+
+# VPN ON: remove bypass, add tproxy rules (insert before catch-all)
+apply_vpn_on() {
+    local m="$1"
+    local port="${2:-$TPROXY_PORT}"
+    remove_bypass "$m"
+    nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $m" | grep -q "tproxy" && return 0
+    nft insert rule ip proxy_tproxy prerouting \
+        iifname "br-lan" ether saddr "$m" \
+        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+    nft insert rule ip proxy_tproxy prerouting \
+        iifname "br-lan" ether saddr "$m" \
+        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+}
+
+# VPN OFF: remove tproxy rules, add bypass so catch-all does not apply
+apply_vpn_off() {
+    local m="$1"
+    nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
+        grep "ether saddr $m" | grep "tproxy" | \
+        grep -oE 'handle [0-9]+' | awk '{print $2}' | while read handle; do
+            nft delete rule ip proxy_tproxy prerouting handle "$handle" 2>/dev/null
+        done
+    add_bypass "$m"
 }
 
 apply_zapret_off() {
@@ -123,9 +145,9 @@ if valid_mac "$mac" && [ -n "$action" ]; then
     cur_vpn=$(get_vpn_state "$mac")
     cur_zapret=$(get_zapret_state "$mac")
     cur_preset=$(get_preset_state "$mac")
-    [ -z "$cur_vpn" ] && cur_vpn="false"
-    [ -z "$cur_zapret" ] && cur_zapret="true"
-    [ -z "$cur_preset" ] && cur_preset="full_vpn"
+    [ -z "$cur_vpn" ] && cur_vpn="true"
+    [ -z "$cur_zapret" ] && cur_zapret="false"
+    [ -z "$cur_preset" ] && cur_preset="global_except_ru"
 
     case "$action" in
         vpn_on)
@@ -133,15 +155,27 @@ if valid_mac "$mac" && [ -n "$action" ]; then
             apply_vpn_on "$mac" "$port"
             set_state "$mac" "true" "$cur_zapret" "$cur_preset"
             ;;
-        vpn_off)    apply_vpn_off "$mac"; set_state "$mac" "false" "$cur_zapret" "$cur_preset" ;;
-        zapret_on)  apply_zapret_on "$mac";  set_state "$mac" "$cur_vpn" "true" "$cur_preset" ;;
-        zapret_off) apply_zapret_off "$mac"; set_state "$mac" "$cur_vpn" "false" "$cur_preset" ;;
-        set_name)   set_device_name "$mac" "$name" ;;
+        vpn_off)
+            apply_vpn_off "$mac"
+            set_state "$mac" "false" "$cur_zapret" "$cur_preset"
+            ;;
+        zapret_on)
+            apply_zapret_on "$mac"
+            set_state "$mac" "$cur_vpn" "true" "$cur_preset"
+            ;;
+        zapret_off)
+            apply_zapret_off "$mac"
+            set_state "$mac" "$cur_vpn" "false" "$cur_preset"
+            ;;
+        set_name)
+            set_device_name "$mac" "$name"
+            ;;
         set_routing)
             if echo "$preset" | grep -qE '^(full_vpn|global_except_ru)$'; then
                 new_port=$(get_tproxy_port "$preset")
-                if nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -q "ether saddr $mac"; then
+                if nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $mac" | grep -q "tproxy"; then
                     apply_vpn_off "$mac"
+                    remove_bypass "$mac"
                     apply_vpn_on "$mac" "$new_port"
                 fi
                 set_state "$mac" "$cur_vpn" "$cur_zapret" "$preset"
@@ -149,13 +183,17 @@ if valid_mac "$mac" && [ -n "$action" ]; then
             ;;
         add_device)
             [ -n "$name" ] && set_device_name "$mac" "$name"
-            set_state "$mac" "false" "true" "full_vpn"
+            port=$(get_tproxy_port "global_except_ru")
+            apply_vpn_on "$mac" "$port"
+            apply_zapret_off "$mac"
+            set_state "$mac" "true" "false" "global_except_ru"
             ;;
         delete_device)
             apply_vpn_off "$mac"
+            remove_bypass "$mac"
             apply_zapret_on "$mac"
-            sed -i "s/\"$mac\":{[^}]*},\\?//g; s/,}/}/g; s/{,/{/g" "$STATE_FILE"
-            sed -i "s/\"$mac\":\"[^\"]*\",\\?//g; s/,}/}/g; s/{,/{/g" "$NAMES_FILE"
+            sed -i "s/\"$mac\":{[^}]*},\?//g; s/,}/}/g; s/{,/{/g" "$STATE_FILE"
+            sed -i "s/\"$mac\":\"[^\"]*\",\?//g; s/,}/}/g; s/{,/{/g" "$NAMES_FILE"
             ;;
     esac
 
@@ -176,8 +214,12 @@ get_devices() {
 
 devices=$(get_devices | awk '!seen[$1]++ {print}')
 
-nft_vpn_macs=$(nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
+# Detect actual nft state
+nft_rules=$(nft list chain ip proxy_tproxy prerouting 2>/dev/null)
+nft_vpn_macs=$(echo "$nft_rules" | grep "tproxy" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
+nft_bypass_macs=$(echo "$nft_rules" | grep -v "tproxy" | grep "ether saddr" | grep "accept" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
 nft_zapret_skip=$(nft list chain inet proxy_route forward_zapret 2>/dev/null | grep "return" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
+has_catchall=$(echo "$nft_rules" | grep "tproxy" | grep -v "ether saddr" | grep -c "br-lan")
 
 # --- HTML output ---
 echo "Content-Type: text/html; charset=utf-8"
@@ -197,7 +239,9 @@ h1{text-align:center;margin-bottom:20px;font-size:1.4em;color:#00d2ff}
 .info{flex:1;min-width:150px}
 .hostname{font-weight:600;font-size:1.05em;color:#fff;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .edit-btn{background:none;border:none;color:#00d2ff;cursor:pointer;font-size:.75em;padding:2px 6px}
+.edit-btn:hover{text-decoration:underline}
 .del-btn{background:none;border:none;color:#ff4444;cursor:pointer;font-size:.7em;padding:2px 6px}
+.del-btn:hover{text-decoration:underline}
 .name-input{background:#0f3460;border:1px solid #00d2ff;color:#fff;border-radius:6px;padding:4px 8px;font-size:.9em;width:140px}
 .name-save{background:#00d2ff;color:#000;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.8em;font-weight:600}
 .ip{color:#888;font-size:.85em}
@@ -206,17 +250,21 @@ h1{text-align:center;margin-bottom:20px;font-size:1.4em;color:#00d2ff}
 .btn{padding:8px 16px;border:none;border-radius:8px;font-size:.85em;font-weight:600;cursor:pointer;text-decoration:none;text-align:center;min-width:90px;transition:background .2s}
 .btn-on{background:#00c853;color:#fff}
 .btn-off{background:#444;color:#aaa}
+.btn-default{background:#0f7c3f;color:#cfc;border:1px dashed #00c853}
 .btn-on:hover{background:#00e676}
 .btn-off:hover{background:#555}
+.btn-default:hover{background:#0a9e4f}
 .label{font-size:.7em;display:block;color:#888;margin-bottom:2px;text-transform:uppercase;letter-spacing:1px}
 .toggle{display:flex;flex-direction:column;align-items:center}
 .preset-select{background:#0f3460;color:#e0e0e0;border:1px solid #333;border-radius:8px;padding:6px 8px;font-size:.8em;cursor:pointer}
+.preset-select:focus{border-color:#00d2ff;outline:none}
 .add-section{background:#16213e;border-radius:12px;padding:16px;margin-bottom:16px}
 .add-section h2{font-size:1em;color:#00d2ff;margin-bottom:10px}
 .add-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .add-input{background:#0f3460;border:1px solid #333;color:#fff;border-radius:8px;padding:8px 12px;font-size:.9em}
 .add-input:focus{border-color:#00d2ff;outline:none}
 .add-btn{background:#00d2ff;color:#000;border:none;border-radius:8px;padding:8px 16px;font-weight:600;cursor:pointer;font-size:.9em}
+.add-btn:hover{background:#33ddff}
 .footer{text-align:center;margin-top:20px;color:#555;font-size:.8em}
 </style>
 <script>
@@ -251,7 +299,7 @@ function changePreset(mac, preset) {
 <body>
 <h1>VPN / Zapret Control Panel</h1>
 <div class="add-section">
-<h2>+ Add device</h2>
+<h2>+ Add device (default: VPN ON, Global -RU)</h2>
 <form class="add-form" method="POST" action="/cgi-bin/vpn">
 <input type="hidden" name="action" value="add_device">
 <input class="add-input" type="text" name="mac" placeholder="MAC (aa:bb:cc:dd:ee:ff)" pattern="[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}" required style="width:220px">
@@ -277,16 +325,37 @@ echo "$devices" | while read mac ip dhcp_name; do
         display_name="$mac"
     fi
 
-    vpn_st="false"
-    echo "$nft_vpn_macs" | grep -qi "$mac" && vpn_st="true"
+    # Detect real state from nft
+    has_tproxy=""
+    has_bypass=""
+    echo "$nft_vpn_macs" | grep -qi "$mac" && has_tproxy="yes"
+    echo "$nft_bypass_macs" | grep -qi "$mac" && has_bypass="yes"
+
+    # Determine VPN display state
+    is_default=""
+    if [ -n "$has_tproxy" ]; then
+        vpn_st="true"
+    elif [ -n "$has_bypass" ]; then
+        vpn_st="false"
+    elif [ "$has_catchall" -gt 0 ] 2>/dev/null; then
+        vpn_st="true"
+        is_default="yes"
+    else
+        vpn_st="false"
+    fi
+
     zapret_st="true"
     echo "$nft_zapret_skip" | grep -qi "$mac" && zapret_st="false"
 
     dev_preset=$(get_preset_state "$mac")
-    [ -z "$dev_preset" ] && dev_preset="full_vpn"
+    [ -z "$dev_preset" ] && dev_preset="global_except_ru"
 
     if [ "$vpn_st" = "true" ]; then
-        vpn_class="btn-on"; vpn_text="VPN ON"; vpn_action="vpn_off"
+        if [ -n "$is_default" ]; then
+            vpn_class="btn-default"; vpn_text="DEFAULT"; vpn_action="vpn_off"
+        else
+            vpn_class="btn-on"; vpn_text="VPN ON"; vpn_action="vpn_off"
+        fi
     else
         vpn_class="btn-off"; vpn_text="VPN OFF"; vpn_action="vpn_on"
     fi
@@ -339,7 +408,7 @@ EOF
 done
 
 cat <<'HTMLFOOT'
-<div class="footer">Cudy VPN/Zapret Manager</div>
+<div class="footer">VPN/Zapret Manager | Default: VPN ON (Global -RU)</div>
 </body>
 </html>
 HTMLFOOT

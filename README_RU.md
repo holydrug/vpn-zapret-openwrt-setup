@@ -14,6 +14,19 @@
 - **zapret (nfqws2)** — обход DPI для YouTube, Discord и т.д. без VPN
 - **Веб-панель** (`http://192.168.2.1/cgi-bin/vpn`) — управление VPN и zapret per-device по MAC
 - **nftables tproxy** — маршрутизация трафика устройств через sing-box
+- **VPN по умолчанию** — все новые устройства автоматически идут через VPN (Global -RU) через catch-all правило nftables
+
+## Поведение по умолчанию
+
+Все новые устройства, подключающиеся к Wi-Fi, **автоматически маршрутизируются через VPN** (пресет global_except_ru — весь трафик кроме российских IP/доменов идёт через VLESS-прокси). Это реализовано через catch-all правило nftables tproxy в конце цепочки.
+
+| Тип устройства | Поведение |
+|---|---|
+| Новое/неизвестное | VPN ON через catch-all (Global -RU) |
+| С явным `vpn:true` | VPN ON по своим настройкам |
+| С явным `vpn:false` | Прямой интернет (обход catch-all) |
+
+Чтобы исключить устройство из VPN, выключите его в веб-панели — будет создано явное bypass-правило.
 
 ## Предварительные шаги (ручные)
 
@@ -81,10 +94,46 @@ WIFI_SSID=MyWiFi WIFI_PASSWORD=secret sh setup.sh
 - Выбор пресета маршрутизации (Full VPN / Global -RU)
 - Добавление/удаление устройств по MAC
 - Именование устройств
+- Кнопка **DEFAULT** — устройство под catch-all VPN (нажать для отключения)
+- Новые устройства, добавленные через панель, получают VPN ON (Global -RU) по умолчанию
+
+## Как это работает
+
+### Цепочка nftables tproxy
+
+Цепочка `ip proxy_tproxy` prerouting устроена так:
+
+```
+1. Per-MAC tproxy правила (vpn:true)     → трафик через sing-box на указанный порт
+2. Per-MAC accept bypass (vpn:false)      → обход catch-all, прямой интернет
+3. Catch-all tproxy правило               → весь оставшийся трафик через sing-box (порт 12346)
+```
+
+При отключении VPN для устройства через веб-панель добавляется явное `accept` bypass-правило, чтобы catch-all не применялся к этому устройству.
+
+### Файлы состояния
+
+- `/etc/vpn_state.json` — настройки VPN/zapret/routing per-device
+- `/etc/device_names.json` — пользовательские имена устройств
 
 ## После перезагрузки
 
 Все настройки автоматически восстанавливаются через init.d скрипт `proxy-tproxy`, который:
-- Создаёт nftables таблицы
+- Создаёт nftables таблицы и цепочки
 - Настраивает ip rule/route для tproxy
 - Восстанавливает per-device правила из `/etc/vpn_state.json`
+- Добавляет bypass-правила для устройств с `vpn:false`
+- Добавляет catch-all VPN правило в конец цепочки
+
+## Заметка про IPv6
+
+Если основной роутер (ONT от провайдера) не раздаёт IPv6 (типичная ситуация в России), отключите IPv6 RA и DHCPv6 на LAN-интерфейсе, иначе устройства будут показывать "No Internet":
+
+```sh
+uci set dhcp.lan.dhcpv6='disabled'
+uci set dhcp.lan.ra='disabled'
+uci set dhcp.@dnsmasq[0].filter_aaaa='1'
+uci commit dhcp
+/etc/init.d/dnsmasq restart
+/etc/init.d/odhcpd restart
+```

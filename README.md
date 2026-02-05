@@ -14,6 +14,19 @@ Automated setup for Cudy WR3000 (MT7981) on OpenWrt 24.x with sing-box VPN, zapr
 - **zapret (nfqws2)** — DPI bypass for YouTube, Discord, etc. without VPN
 - **Web panel** (`http://192.168.2.1/cgi-bin/vpn`) — per-device VPN and zapret control by MAC address
 - **nftables tproxy** — per-device traffic routing through sing-box
+- **Default VPN** — all new/unknown devices automatically routed through VPN (Global -RU) via catch-all nftables rule
+
+## Default Behavior
+
+All new devices connecting to Wi-Fi are **automatically routed through VPN** (global_except_ru preset — all traffic except Russian IPs/domains goes through VLESS proxy). This is achieved via a catch-all nftables tproxy rule at the end of the chain.
+
+| Device type | Behavior |
+|---|---|
+| New/unknown device | VPN ON via catch-all (Global -RU) |
+| Device with explicit `vpn:true` | VPN ON per its own settings |
+| Device with explicit `vpn:false` | Direct internet (bypass catch-all) |
+
+To exclude a device from VPN, toggle it off in the web panel — an explicit bypass rule will be created.
 
 ## Prerequisites (Manual)
 
@@ -81,10 +94,46 @@ Features:
 - Select routing preset (Full VPN / Global except RU)
 - Add/remove devices by MAC address
 - Custom device naming
+- **DEFAULT** button — indicates device is covered by catch-all VPN (click to disable)
+- New devices added via the panel default to VPN ON (Global -RU)
+
+## How It Works
+
+### nftables tproxy chain
+
+The `ip proxy_tproxy` prerouting chain is structured as follows:
+
+```
+1. Per-MAC tproxy rules (vpn:true)    → route through sing-box at specific port
+2. Per-MAC accept bypass (vpn:false)  → skip catch-all, direct internet
+3. Catch-all tproxy rule              → route all remaining traffic through sing-box (port 12346)
+```
+
+When VPN is turned OFF for a device via the web panel, an explicit `accept` bypass rule is inserted so the catch-all doesn't apply to that device.
+
+### State files
+
+- `/etc/vpn_state.json` — per-device VPN/zapret/routing settings
+- `/etc/device_names.json` — custom device names
 
 ## After Reboot
 
 All settings are automatically restored via the `proxy-tproxy` init.d script, which:
-- Creates nftables tables
+- Creates nftables tables and chains
 - Sets up ip rule/route for tproxy
 - Restores per-device rules from `/etc/vpn_state.json`
+- Adds bypass rules for devices with `vpn:false`
+- Appends catch-all VPN rule at the end
+
+## IPv6 Note
+
+If your upstream router does not provide IPv6 (common with ISP-provided ONTs in Russia), disable IPv6 RA and DHCPv6 on the LAN interface to prevent "No Internet" indicators on client devices:
+
+```sh
+uci set dhcp.lan.dhcpv6='disabled'
+uci set dhcp.lan.ra='disabled'
+uci set dhcp.@dnsmasq[0].filter_aaaa='1'
+uci commit dhcp
+/etc/init.d/dnsmasq restart
+/etc/init.d/odhcpd restart
+```

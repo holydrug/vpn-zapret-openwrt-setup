@@ -165,43 +165,62 @@ cat > /etc/init.d/proxy-tproxy <<'INITEOF'
 USE_PROCD=0
 START=98
 
+DEFAULT_VPN_PORT="12346"
+
 start() {
     /etc/proxy-tproxy.sh
 
     # Restore per-device VPN rules from state
     STATE_FILE="/etc/vpn_state.json"
-    [ -f "$STATE_FILE" ] || return 0
 
     VPN_SERVER=$(grep -o '"server"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
     [ -z "$VPN_SERVER" ] && return 0
 
-    grep -oE '"[0-9a-f:]{17}":\{[^}]+\}' "$STATE_FILE" | while IFS= read -r entry; do
-        mac=$(echo "$entry" | grep -oE '^"[0-9a-f:]{17}"' | tr -d '"')
-        vpn=$(echo "$entry" | grep -o '"vpn":[^,}]*' | grep -o '[^:]*$' | tr -d ' ')
-        zapret=$(echo "$entry" | grep -o '"zapret":[^,}]*' | grep -o '[^:]*$' | tr -d ' ')
-        routing=$(echo "$entry" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4)
+    if [ -f "$STATE_FILE" ]; then
+        grep -oE '"[0-9a-f:]{17}":\{[^}]+\}' "$STATE_FILE" | while IFS= read -r entry; do
+            mac=$(echo "$entry" | grep -oE '^"[0-9a-f:]{17}"' | tr -d '"')
+            vpn=$(echo "$entry" | grep -o '"vpn":[^,}]*' | grep -o '[^:]*$' | tr -d ' ')
+            zapret=$(echo "$entry" | grep -o '"zapret":[^,}]*' | grep -o '[^:]*$' | tr -d ' ')
+            routing=$(echo "$entry" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4)
 
-        [ -z "$routing" ] && routing="full_vpn"
+            [ -z "$routing" ] && routing="global_except_ru"
 
-        if [ "$vpn" = "true" ]; then
-            case "$routing" in
-                global_except_ru) port=12346 ;;
-                *) port=12345 ;;
-            esac
-            nft add rule ip proxy_tproxy prerouting \
-                iifname "br-lan" ether saddr "$mac" \
-                ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
-                meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
-            nft add rule ip proxy_tproxy prerouting \
-                iifname "br-lan" ether saddr "$mac" \
-                ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
-                meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
-        fi
+            if [ "$vpn" = "true" ]; then
+                case "$routing" in
+                    global_except_ru) port=12346 ;;
+                    *) port=12345 ;;
+                esac
+                nft add rule ip proxy_tproxy prerouting \
+                    iifname "br-lan" ether saddr "$mac" \
+                    ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+                    meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+                nft add rule ip proxy_tproxy prerouting \
+                    iifname "br-lan" ether saddr "$mac" \
+                    ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+                    meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+            elif [ "$vpn" = "false" ]; then
+                # Explicit bypass: device skips catch-all VPN
+                nft add rule ip proxy_tproxy prerouting \
+                    iifname "br-lan" ether saddr "$mac" accept 2>/dev/null
+            fi
 
-        if [ "$zapret" = "false" ]; then
-            nft insert rule inet proxy_route forward_zapret ether saddr "$mac" return 2>/dev/null
-        fi
-    done
+            if [ "$zapret" = "false" ]; then
+                nft insert rule inet proxy_route forward_zapret ether saddr "$mac" return 2>/dev/null
+            fi
+        done
+    fi
+
+    # Catch-all: VPN for all unknown devices (global_except_ru)
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "br-lan" \
+        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        meta l4proto tcp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "br-lan" \
+        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        meta l4proto udp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
+
+    logger -t proxy-tproxy "VPN catch-all (port $DEFAULT_VPN_PORT, global_except_ru) enabled"
 }
 INITEOF
 chmod +x /etc/init.d/proxy-tproxy
