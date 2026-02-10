@@ -1,4 +1,5 @@
-<img width="972" height="1006" alt="{2B09AAC5-1E2D-48F0-99E2-45941BB9E93C}" src="https://github.com/user-attachments/assets/ee2bdf6b-b50e-43d2-a7c0-d0e2d5facd49" />
+<img width="991" height="887" alt="{B431A199-F782-4188-806C-158DFD2E2A64}" src="https://github.com/user-attachments/assets/8156e4e9-156b-44d1-94b5-df52cec27910" />
+
 
 **English** | [Русский](README_RU.md)
 
