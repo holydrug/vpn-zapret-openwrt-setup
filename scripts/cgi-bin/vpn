@@ -352,6 +352,18 @@ rebuild_catchall() {
     nft add rule inet proxy_route forward_zapret iifname "br-lan" return 2>/dev/null
 }
 
+# Auto-update default profile when no devices remain on current default
+auto_update_default() {
+    local new_pid="$1"
+    local cur_default=$(get_default_profile_id)
+    [ "$new_pid" = "$cur_default" ] && return 0
+    # If any device still uses the current default, keep it
+    grep -q "\"profile_id\":\"$cur_default\"" "$STATE_FILE" && return 0
+    # No devices on old default — switch default and rebuild catch-all
+    sed -i "s/\"default_profile_id\":\"[^\"]*\"/\"default_profile_id\":\"$new_pid\"/" "$PROFILES_FILE"
+    rebuild_catchall
+}
+
 # ===== Profile CRUD actions =====
 
 do_add_profile() {
@@ -576,6 +588,7 @@ if valid_mac "$mac" && [ -n "$action" ]; then
                     apply_vpn_on "$mac" "$new_port"
                 fi
                 set_state "$mac" "$cur_vpn" "$cur_zapret" "$cur_preset" "$profile_id"
+                auto_update_default "$profile_id"
             fi
             ;;
         add_device)

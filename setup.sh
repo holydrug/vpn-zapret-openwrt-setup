@@ -122,13 +122,23 @@ if [ -z "$WIFI_SSID_5G" ]; then
 fi
 
 # Validate required params
-for var in VLESS_SERVER VLESS_UUID REALITY_PUBLIC_KEY REALITY_SHORT_ID WIFI_SSID WIFI_PASSWORD; do
+for var in VLESS_SERVER VLESS_UUID WIFI_SSID WIFI_PASSWORD; do
     eval val=\$$var
     if [ -z "$val" ]; then
         warn "Missing required parameter: $var"
         exit 1
     fi
 done
+# Reality-specific params required only when security != none
+if [ "$VLESS_SECURITY" != "none" ]; then
+    for var in REALITY_PUBLIC_KEY REALITY_SHORT_ID; do
+        eval val=\$$var
+        if [ -z "$val" ]; then
+            warn "Missing required parameter: $var (needed for security=$VLESS_SECURITY)"
+            exit 1
+        fi
+    done
+fi
 
 # ===== 1. Install packages =====
 log "Installing packages..."
@@ -415,6 +425,17 @@ add_catchall() {
     [ -n "$ALL_SERVERS" ] && VPN_EXCLUDE="$VPN_EXCLUDE, $ALL_SERVERS"
 
     DEFAULT_PID=$(get_default_profile_id)
+
+    # Auto-fix: if no device uses the current default, pick the most used profile
+    if [ -f "$STATE_FILE" ] && ! grep -q "\"profile_id\":\"$DEFAULT_PID\"" "$STATE_FILE"; then
+        MOST_USED=$(grep -o '"profile_id":"[^"]*"' "$STATE_FILE" | sort | uniq -c | sort -rn | head -1 | grep -o '"[^"]*"$' | tr -d '"')
+        if [ -n "$MOST_USED" ] && [ "$MOST_USED" != "$DEFAULT_PID" ]; then
+            sed -i "s/\"default_profile_id\":\"[^\"]*\"/\"default_profile_id\":\"$MOST_USED\"/" "$PROFILES_FILE"
+            DEFAULT_PID="$MOST_USED"
+            logger -t proxy-routing "Auto-switched default profile to $DEFAULT_PID"
+        fi
+    fi
+
     DEFAULT_VPN_PORT=$(get_profile_port "$DEFAULT_PID" "global_except_ru")
     [ -z "$DEFAULT_VPN_PORT" ] && DEFAULT_VPN_PORT=12346
 
