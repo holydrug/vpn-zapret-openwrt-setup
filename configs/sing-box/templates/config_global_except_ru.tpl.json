@@ -43,21 +43,7 @@
       "tag": "vless-out",
       "server": "%%VLESS_SERVER%%",
       "server_port": %%VLESS_PORT%%,
-      "uuid": "%%VLESS_UUID%%",
-      "flow": "%%VLESS_FLOW%%",
-      "tls": {
-        "enabled": true,
-        "server_name": "%%REALITY_SNI%%",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "%%TLS_FINGERPRINT%%"
-        },
-        "reality": {
-          "enabled": true,
-          "public_key": "%%REALITY_PUBLIC_KEY%%",
-          "short_id": "%%REALITY_SHORT_ID%%"
-        }
-      }
+      "uuid": "%%VLESS_UUID%%"%%VLESS_SECURITY_BLOCK%%
     },
     {
       "type": "direct",

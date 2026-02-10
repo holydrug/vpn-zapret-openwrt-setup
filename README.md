@@ -2,17 +2,18 @@
 
 **English** | [Русский](README_RU.md)
 
-# Cudy WR3000 OpenWrt Setup
+# OpenWrt VPN Setup
 
-Automated setup for Cudy WR3000 (MT7981) on OpenWrt 24.x with sing-box VPN, zapret (DPI bypass), and a web control panel.
+Automated VPN + DPI bypass setup for OpenWrt routers with sing-box, zapret, and a web control panel. Tested on Cudy WR3000 (MT7981), works on any OpenWrt device with sing-box and nftables support.
 
 ## What Gets Configured
 
-- **sing-box** — two VLESS+Reality instances:
-  - `full_vpn` (port 12345) — all traffic through VPN
-  - `global_except_ru` (port 12346) — all traffic through VPN except Russian IPs/domains
+- **sing-box** — multi-profile VLESS proxy (Reality and plain `security=none`):
+  - `full_vpn` — all traffic through VPN
+  - `global_except_ru` — all traffic through VPN except Russian IPs/domains
+  - Each profile gets a dedicated pair of sing-box instances on unique ports
 - **zapret (nfqws2)** — DPI bypass for YouTube, Discord, etc. without VPN
-- **Web panel** (`http://192.168.2.1/cgi-bin/vpn`) — per-device VPN and zapret control by MAC address
+- **Web panel** (`http://<ROUTER_IP>/cgi-bin/vpn`) — per-device VPN and zapret control by MAC address
 - **nftables tproxy** — per-device traffic routing through sing-box
 - **Default VPN** — all new/unknown devices automatically routed through VPN (Global -RU) via catch-all nftables rule
 
@@ -28,15 +29,29 @@ All new devices connecting to Wi-Fi are **automatically routed through VPN** (gl
 
 To exclude a device from VPN, toggle it off in the web panel — an explicit bypass rule will be created.
 
-## Prerequisites (Manual)
+## Compatibility
 
-1. Flash Cudy WR3000 with OpenWrt (sysupgrade)
+| Requirement | Details |
+|---|---|
+| OpenWrt version | 23.05+ (tested on 24.x) |
+| sing-box | Available in opkg (`opkg install sing-box`) |
+| nftables | Required (default in OpenWrt 22+) |
+| RAM | 256 MB recommended (each profile ≈ 2 sing-box instances) |
+| USB storage | Optional, needed only for zapret |
+
+The setup is router-agnostic — it works on any OpenWrt device as long as the requirements above are met. Cudy WR3000 is used as the reference platform.
+
+## Prerequisites
+
+1. Flash your router with OpenWrt (sysupgrade or factory image)
 2. Configure networking:
-   - WAN: `eth0`, DHCP (receives IP from upstream router)
-   - LAN: `br-lan` (`eth1`), static `192.168.2.1/24`
-3. Ensure SSH access: `ssh root@192.168.2.1`
-4. Attach USB drive (mounted at `/mnt/usb`)
+   - WAN: DHCP (receives IP from upstream router)
+   - LAN: static IP (e.g. `192.168.2.1/24`)
+3. Ensure SSH access: `ssh root@<ROUTER_IP>`
+4. (Optional) Attach USB drive for zapret (mounted at `/mnt/usb`)
 5. Verify internet connectivity: `ping 8.8.8.8`
+
+> **Example (Cudy WR3000):** WAN = `eth0` (DHCP), LAN = `br-lan` (`eth1`, static `192.168.2.1/24`). Interface names may differ on other routers — check with `ip link`.
 
 ## Installation
 
@@ -50,48 +65,69 @@ cd /tmp/cudy-openwrt-setup
 sh setup.sh
 ```
 
-The script will prompt for:
+The script accepts a `vless://` URI as input (recommended) or individual parameters:
 
-| Parameter | Description | Default |
-|---|---|---|
-| `VLESS_SERVER` | VLESS server IP | — |
-| `VLESS_PORT` | Port | `42832` |
-| `VLESS_UUID` | UUID | — |
-| `REALITY_PUBLIC_KEY` | Reality public key | — |
-| `REALITY_SHORT_ID` | Short ID | — |
-| `REALITY_SNI` | SNI | `www.icloud.com` |
-| `WIFI_SSID` | Wi-Fi 2.4GHz SSID | — |
-| `WIFI_PASSWORD` | Wi-Fi password | — |
-| `WIFI_SSID_5G` | Wi-Fi 5GHz SSID | `{SSID}_5G` |
+**Option 1 — vless:// URI (recommended):**
 
-Parameters can also be passed as environment variables:
+```sh
+sh setup.sh
+# When prompted, paste your vless:// URI
+# Both Reality and plain (security=none) URIs are supported
+```
+
+**Option 2 — environment variables:**
 
 ```sh
 VLESS_SERVER=1.2.3.4 VLESS_UUID=xxx REALITY_PUBLIC_KEY=yyy REALITY_SHORT_ID=zzz \
 WIFI_SSID=MyWiFi WIFI_PASSWORD=secret sh setup.sh
 ```
 
+**Parameters:**
+
+| Parameter | Description | Default |
+|---|---|---|
+| `VLESS_SERVER` | VLESS server IP | — |
+| `VLESS_PORT` | Port | `42832` |
+| `VLESS_UUID` | UUID | — |
+| `REALITY_PUBLIC_KEY` | Reality public key (not needed for `security=none`) | — |
+| `REALITY_SHORT_ID` | Short ID (not needed for `security=none`) | — |
+| `REALITY_SNI` | SNI | `www.icloud.com` |
+| `WIFI_SSID` | Wi-Fi 2.4GHz SSID | — |
+| `WIFI_PASSWORD` | Wi-Fi password | — |
+| `WIFI_SSID_5G` | Wi-Fi 5GHz SSID | `{SSID}_5G` |
+
 ## Repository Structure
 
 ```
-├── setup.sh                          # Main setup script
+├── setup.sh                              # Main setup script
 ├── configs/
-│   ├── sing-box/                     # sing-box config templates
-│   ├── zapret/                       # zapret config and hostlist
-│   └── nftables/                     # nft table creation script
+│   ├── sing-box/
+│   │   ├── templates/                    # sing-box config templates (%%PLACEHOLDER%% syntax)
+│   │   │   ├── config_full_vpn.tpl.json
+│   │   │   └── config_global_except_ru.tpl.json
+│   │   └── rules/                        # Local rule sets (geoip-ru.srs, geosite-category-ru.srs)
+│   ├── zapret/                           # zapret config and hostlist
+│   └── nftables/                         # nft table creation script
 ├── scripts/
-│   ├── init.d/sing-box               # sing-box init.d script
-│   └── cgi-bin/vpn                   # CGI web panel
+│   ├── init.d/sing-box                   # sing-box init.d script
+│   ├── cgi-bin/vpn                       # CGI web panel
+│   └── update-rulesets.sh                # Rule set updater (geoip/geosite)
 ```
 
 ## Web Panel
 
-Available at `http://192.168.2.1/cgi-bin/vpn`.
+Available at `http://<ROUTER_IP>/cgi-bin/vpn`.
 
 Features:
 - Toggle VPN on/off per device
 - Toggle zapret (DPI bypass) on/off per device
 - Select routing preset (Full VPN / Global except RU)
+- **Multi-profile management:**
+  - Add new profiles via `vless://` URI (Reality and plain)
+  - Delete profiles
+  - Rename profiles
+  - Assign profiles to individual devices
+  - Set default profile for new devices
 - Add/remove devices by MAC address
 - Custom device naming
 - **DEFAULT** button — indicates device is covered by catch-all VPN (click to disable)
@@ -104,9 +140,9 @@ Features:
 The `ip proxy_tproxy` prerouting chain is structured as follows:
 
 ```
-1. Per-MAC tproxy rules (vpn:true)    → route through sing-box at specific port
+1. Per-MAC tproxy rules (vpn:true)    → route through sing-box at profile-specific port
 2. Per-MAC accept bypass (vpn:false)  → skip catch-all, direct internet
-3. Catch-all tproxy rule              → route all remaining traffic through sing-box (port 12346)
+3. Catch-all tproxy rule              → route all remaining traffic through sing-box (default profile)
 ```
 
 When VPN is turned OFF for a device via the web panel, an explicit `accept` bypass rule is inserted so the catch-all doesn't apply to that device.
@@ -115,6 +151,7 @@ When VPN is turned OFF for a device via the web panel, an explicit `accept` bypa
 
 - `/etc/vpn_state.json` — per-device VPN/zapret/routing settings
 - `/etc/device_names.json` — custom device names
+- `/etc/vless_profiles.json` — VLESS profiles (servers, ports, credentials)
 
 ## After Reboot
 

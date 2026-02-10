@@ -41,7 +41,7 @@ parse_vless_uri() {
     VLESS_SERVER="${hostport%:*}"
     VLESS_PORT="${hostport##*:}"
 
-    REALITY_PUBLIC_KEY="" ; REALITY_SHORT_ID="" ; REALITY_SNI="" ; TLS_FINGERPRINT="chrome" ; VLESS_FLOW=""
+    REALITY_PUBLIC_KEY="" ; REALITY_SHORT_ID="" ; REALITY_SNI="" ; TLS_FINGERPRINT="chrome" ; VLESS_FLOW="" ; VLESS_SECURITY="reality"
     local old_ifs="$IFS"
     IFS='&'
     for kv in $query; do
@@ -52,14 +52,25 @@ parse_vless_uri() {
             sni) REALITY_SNI="$v" ;;
             fp) TLS_FINGERPRINT="$v" ;;
             flow) VLESS_FLOW="$v" ;;
+            security) VLESS_SECURITY="$v" ;;
         esac
     done
     IFS="$old_ifs"
 
-    [ -z "$VLESS_FLOW" ] && VLESS_FLOW="xtls-rprx-vision"
     [ -z "$TLS_FINGERPRINT" ] && TLS_FINGERPRINT="chrome"
     [ -z "$VLESS_PROFILE_NAME" ] && VLESS_PROFILE_NAME="$VLESS_SERVER"
-    [ -z "$REALITY_SNI" ] && REALITY_SNI="www.icloud.com"
+
+    case "$VLESS_SECURITY" in
+        none)
+            VLESS_FLOW=""
+            REALITY_PUBLIC_KEY="" ; REALITY_SHORT_ID="" ; REALITY_SNI=""
+            ;;
+        *)
+            VLESS_SECURITY="reality"
+            [ -z "$VLESS_FLOW" ] && VLESS_FLOW="xtls-rprx-vision"
+            [ -z "$REALITY_SNI" ] && REALITY_SNI="www.icloud.com"
+            ;;
+    esac
 }
 
 # ===== Gather parameters =====
@@ -156,10 +167,35 @@ PROFILE_ID="p1"
 PORT_FULL=12345
 PORT_GLOBAL=12346
 
-echo "{\"profiles\":[{\"id\":\"$PROFILE_ID\",\"name\":\"$VLESS_PROFILE_NAME\",\"server\":\"$VLESS_SERVER\",\"server_port\":$VLESS_PORT,\"uuid\":\"$VLESS_UUID\",\"public_key\":\"$REALITY_PUBLIC_KEY\",\"short_id\":\"$REALITY_SHORT_ID\",\"sni\":\"$REALITY_SNI\",\"fingerprint\":\"$TLS_FINGERPRINT\",\"flow\":\"$VLESS_FLOW\",\"port_full_vpn\":$PORT_FULL,\"port_global_except_ru\":$PORT_GLOBAL}],\"default_profile_id\":\"$PROFILE_ID\",\"next_port\":12347,\"next_id\":2}" > "$PROFILES_FILE"
+echo "{\"profiles\":[{\"id\":\"$PROFILE_ID\",\"name\":\"$VLESS_PROFILE_NAME\",\"server\":\"$VLESS_SERVER\",\"server_port\":$VLESS_PORT,\"uuid\":\"$VLESS_UUID\",\"security\":\"$VLESS_SECURITY\",\"public_key\":\"$REALITY_PUBLIC_KEY\",\"short_id\":\"$REALITY_SHORT_ID\",\"sni\":\"$REALITY_SNI\",\"fingerprint\":\"$TLS_FINGERPRINT\",\"flow\":\"$VLESS_FLOW\",\"port_full_vpn\":$PORT_FULL,\"port_global_except_ru\":$PORT_GLOBAL}],\"default_profile_id\":\"$PROFILE_ID\",\"next_port\":12347,\"next_id\":2}" > "$PROFILES_FILE"
 
 # ===== 5. Generate sing-box configs from templates =====
 log "Generating sing-box configs for initial profile..."
+
+# Build security block (flow + tls) or empty for security=none
+SEC_FILE="/tmp/sb_sec_block_$$"
+if [ "$VLESS_SECURITY" = "none" ]; then
+    printf '' > "$SEC_FILE"
+else
+    cat > "$SEC_FILE" << SECEOF
+,
+      "flow": "$VLESS_FLOW",
+      "tls": {
+        "enabled": true,
+        "server_name": "$REALITY_SNI",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "$TLS_FINGERPRINT"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "$REALITY_PUBLIC_KEY",
+          "short_id": "$REALITY_SHORT_ID"
+        }
+      }
+SECEOF
+fi
+
 for mode in full_vpn global_except_ru; do
     tpl="/etc/sing-box/templates/config_${mode}.tpl.json"
     case "$mode" in
@@ -172,13 +208,18 @@ for mode in full_vpn global_except_ru; do
         -e "s|%%VLESS_SERVER%%|$VLESS_SERVER|g" \
         -e "s|%%VLESS_PORT%%|$VLESS_PORT|g" \
         -e "s|%%VLESS_UUID%%|$VLESS_UUID|g" \
-        -e "s|%%REALITY_PUBLIC_KEY%%|$REALITY_PUBLIC_KEY|g" \
-        -e "s|%%REALITY_SHORT_ID%%|$REALITY_SHORT_ID|g" \
-        -e "s|%%REALITY_SNI%%|$REALITY_SNI|g" \
-        -e "s|%%TLS_FINGERPRINT%%|$TLS_FINGERPRINT|g" \
-        -e "s|%%VLESS_FLOW%%|$VLESS_FLOW|g" \
-        "$tpl" > "/etc/sing-box/config_${mode}_${PROFILE_ID}.json"
+        "$tpl" | awk -v secfile="$SEC_FILE" '
+        /%%VLESS_SECURITY_BLOCK%%/ {
+            gsub(/%%VLESS_SECURITY_BLOCK%%/, "")
+            printf "%s", $0
+            while ((getline line < secfile) > 0) print line
+            close(secfile)
+            next
+        }
+        { print }
+        ' > "/etc/sing-box/config_${mode}_${PROFILE_ID}.json"
 done
+rm -f "$SEC_FILE"
 
 # ===== 6. Deploy sing-box init.d =====
 log "Deploying sing-box init.d script..."

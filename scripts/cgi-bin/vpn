@@ -117,7 +117,7 @@ parse_vless_uri() {
     P_PORT="${hostport##*:}"
 
     # Parse query params
-    P_PBK="" ; P_SID="" ; P_SNI="" ; P_FP="chrome" ; P_FLOW=""
+    P_PBK="" ; P_SID="" ; P_SNI="" ; P_FP="chrome" ; P_FLOW="" ; P_SECURITY="reality"
     local old_ifs="$IFS"
     IFS='&'
     for kv in $query; do
@@ -128,20 +128,32 @@ parse_vless_uri() {
             sni) P_SNI="$v" ;;
             fp) P_FP="$v" ;;
             flow) P_FLOW="$v" ;;
+            security) P_SECURITY="$v" ;;
         esac
     done
     IFS="$old_ifs"
 
-    [ -z "$P_FLOW" ] && P_FLOW="xtls-rprx-vision"
     [ -z "$P_FP" ] && P_FP="chrome"
     [ -z "$P_NAME" ] && P_NAME="$P_SERVER"
+
+    # Defaults depend on security type
+    case "$P_SECURITY" in
+        none)
+            P_FLOW=""
+            P_PBK="" ; P_SID="" ; P_SNI=""
+            ;;
+        *)
+            P_SECURITY="reality"
+            [ -z "$P_FLOW" ] && P_FLOW="xtls-rprx-vision"
+            ;;
+    esac
 
     # Validate
     [ -z "$P_UUID" ] && return 1
     [ -z "$P_SERVER" ] && return 1
     [ -z "$P_PORT" ] && return 1
-    [ -z "$P_PBK" ] && return 1
-    [ -z "$P_SID" ] && return 1
+    # Reality requires pbk and sid
+    [ "$P_SECURITY" = "reality" ] && { [ -z "$P_PBK" ] && return 1; [ -z "$P_SID" ] && return 1; }
     [ "$P_PORT" -ge 1 ] 2>/dev/null && [ "$P_PORT" -le 65535 ] 2>/dev/null || return 1
     return 0
 }
@@ -153,7 +165,31 @@ generate_configs() {
     local server="$4" server_port="$5" uuid="$6"
     local pbk="$7" sid="$8" sni="$9"
     shift 9
-    local fp="$1" flow="$2"
+    local fp="$1" flow="$2" security="$3"
+
+    # Build security block (flow + tls) or empty for security=none
+    local sec_file="/tmp/sb_sec_block_$$"
+    if [ "$security" = "none" ]; then
+        printf '' > "$sec_file"
+    else
+        cat > "$sec_file" << SECEOF
+,
+      "flow": "$flow",
+      "tls": {
+        "enabled": true,
+        "server_name": "$sni",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "$fp"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "$pbk",
+          "short_id": "$sid"
+        }
+      }
+SECEOF
+    fi
 
     for mode in full_vpn global_except_ru; do
         local tpl="$TEMPLATES_DIR/config_${mode}.tpl.json"
@@ -169,13 +205,18 @@ generate_configs() {
             -e "s|%%VLESS_SERVER%%|$server|g" \
             -e "s|%%VLESS_PORT%%|$server_port|g" \
             -e "s|%%VLESS_UUID%%|$uuid|g" \
-            -e "s|%%REALITY_PUBLIC_KEY%%|$pbk|g" \
-            -e "s|%%REALITY_SHORT_ID%%|$sid|g" \
-            -e "s|%%REALITY_SNI%%|$sni|g" \
-            -e "s|%%TLS_FINGERPRINT%%|$fp|g" \
-            -e "s|%%VLESS_FLOW%%|$flow|g" \
-            "$tpl" > "/etc/sing-box/config_${mode}_${pid}.json"
+            "$tpl" | awk -v secfile="$sec_file" '
+            /%%VLESS_SECURITY_BLOCK%%/ {
+                gsub(/%%VLESS_SECURITY_BLOCK%%/, "")
+                printf "%s", $0
+                while ((getline line < secfile) > 0) print line
+                close(secfile)
+                next
+            }
+            { print }
+            ' > "/etc/sing-box/config_${mode}_${pid}.json"
     done
+    rm -f "$sec_file"
 }
 
 # ===== JSON helpers =====
@@ -344,7 +385,7 @@ do_add_profile() {
     local new_next_id=$((next_id + 1))
 
     # Build new profile JSON entry
-    local entry="{\"id\":\"$pid\",\"name\":\"$P_NAME\",\"server\":\"$P_SERVER\",\"server_port\":$P_PORT,\"uuid\":\"$P_UUID\",\"public_key\":\"$P_PBK\",\"short_id\":\"$P_SID\",\"sni\":\"$P_SNI\",\"fingerprint\":\"$P_FP\",\"flow\":\"$P_FLOW\",\"port_full_vpn\":$port_full,\"port_global_except_ru\":$port_global}"
+    local entry="{\"id\":\"$pid\",\"name\":\"$P_NAME\",\"server\":\"$P_SERVER\",\"server_port\":$P_PORT,\"uuid\":\"$P_UUID\",\"security\":\"$P_SECURITY\",\"public_key\":\"$P_PBK\",\"short_id\":\"$P_SID\",\"sni\":\"$P_SNI\",\"fingerprint\":\"$P_FP\",\"flow\":\"$P_FLOW\",\"port_full_vpn\":$port_full,\"port_global_except_ru\":$port_global}"
 
     # Insert into profiles array
     local old_profiles=$(grep -o '"profiles":\[[^]]*\]' "$PROFILES_FILE" | sed 's/"profiles":\[//;s/\]$//')
@@ -363,7 +404,7 @@ do_add_profile() {
 
     # Generate sing-box configs
     generate_configs "$pid" "$port_full" "$port_global" \
-        "$P_SERVER" "$P_PORT" "$P_UUID" "$P_PBK" "$P_SID" "$P_SNI" "$P_FP" "$P_FLOW"
+        "$P_SERVER" "$P_PORT" "$P_UUID" "$P_PBK" "$P_SID" "$P_SNI" "$P_FP" "$P_FLOW" "$P_SECURITY"
 
     # Start new sing-box instances
     /etc/init.d/sing-box restart 2>/dev/null
@@ -729,6 +770,8 @@ get_profile_ids | while read pid; do
     p_port_full=$(get_profile_port "$pid" "full_vpn")
     p_port_global=$(get_profile_port "$pid" "global_except_ru")
     p_server_port=$(grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o '"server_port":[0-9]*' | head -1 | sed 's/"server_port"://')
+    p_security=$(get_profile_field "$pid" "security")
+    [ -z "$p_security" ] && p_security="reality"
 
     # Check server status via sing-box process
     status_class="status-check"
@@ -748,7 +791,7 @@ get_profile_ids | while read pid; do
 <div class="profile-card">
   <div class="profile-info">
     <div class="profile-name" id="pname-${pid}"><span>${p_name}</span><span class="edit-btn" onclick="editProfileName('${pid}','${p_name}')">edit</span>${default_badge} <span class="${status_class}">${status_text}</span></div>
-    <div class="profile-server">${p_server}:${p_server_port}</div>
+    <div class="profile-server">${p_server}:${p_server_port} [${p_security}]</div>
     <div class="profile-ports">Ports: full=${p_port_full} global-ru=${p_port_global}</div>
   </div>
   <div class="profile-actions">
