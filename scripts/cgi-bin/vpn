@@ -450,6 +450,33 @@ auto_update_default() {
     rebuild_catchall
 }
 
+# ===== Kill switch =====
+
+apply_killswitch() {
+    local lan="$LAN_IFACE"
+    # Remove old killswitch rule
+    nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
+        grep 'comment "killswitch"' | grep -oE 'handle [0-9]+' | \
+        awk '{print $2}' | while read h; do
+            nft delete rule ip proxy_tproxy prerouting handle "$h" 2>/dev/null
+        done
+    # Add killswitch drop rule at the END of chain
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "$lan" \
+        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16 }" \
+        drop comment '"killswitch"' 2>/dev/null
+    echo "1" > /etc/vpn_killswitch
+}
+
+remove_killswitch() {
+    nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
+        grep 'comment "killswitch"' | grep -oE 'handle [0-9]+' | \
+        awk '{print $2}' | while read h; do
+            nft delete rule ip proxy_tproxy prerouting handle "$h" 2>/dev/null
+        done
+    echo "0" > /etc/vpn_killswitch
+}
+
 # ===== Profile CRUD actions =====
 
 do_add_profile() {
@@ -589,6 +616,20 @@ do_set_default_profile() {
 # ===== Handle actions =====
 
 case "$action" in
+    killswitch_on)
+        apply_killswitch
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
+    killswitch_off)
+        remove_killswitch
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
     add_rule)
         if [ -n "$rule_domain" ] && echo "$rule_action" | grep -qE '^(direct|vpn)$'; then
             # Validate domain: letters, digits, dots, hyphens only
@@ -926,6 +967,25 @@ EOF
 done
 
 echo "</div>"
+
+# ===== Kill Switch section =====
+killswitch_state=$(cat /etc/vpn_killswitch 2>/dev/null || echo "0")
+if [ "$killswitch_state" = "1" ]; then
+    ks_class="btn-on"; ks_text="ON"; ks_action="killswitch_off"
+else
+    ks_class="btn-off"; ks_text="OFF"; ks_action="killswitch_on"
+fi
+cat <<EOF
+<div class="section">
+  <div style="display:flex;align-items:center;justify-content:space-between">
+    <div>
+      <h2>Kill Switch</h2>
+      <div style="color:#888;font-size:.8em">Drop all traffic if VPN is down</div>
+    </div>
+    <a class="btn ${ks_class}" href="?action=${ks_action}">${ks_text}</a>
+  </div>
+</div>
+EOF
 
 # ===== Custom Routes section =====
 cat <<'CUSTOMHEAD'

@@ -21,3 +21,11 @@ nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -q 'udp dport { 67,
 nft list table inet proxy_route >/dev/null 2>&1 || nft add table inet proxy_route
 nft list chain inet proxy_route forward_zapret >/dev/null 2>&1 || \
     nft add chain inet proxy_route forward_zapret '{ type filter hook forward priority filter; policy accept; }'
+
+# Restore kill switch if enabled
+if [ "$(cat /etc/vpn_killswitch 2>/dev/null)" = "1" ]; then
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "$LAN_IFACE" \
+        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16 }" \
+        drop comment '"killswitch"' 2>/dev/null
+fi
