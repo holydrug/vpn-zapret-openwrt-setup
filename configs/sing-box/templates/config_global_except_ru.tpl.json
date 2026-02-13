@@ -21,6 +21,7 @@
         "outbound": "direct",
         "server": "dns-direct"
       },
+%%CUSTOM_DNS_RULES%%
       {
         "rule_set": "geosite-category-ru",
         "server": "dns-direct"
@@ -62,6 +63,7 @@
         "ip_cidr": ["%%VLESS_SERVER%%/32"],
         "outbound": "direct"
       },
+%%CUSTOM_ROUTE_RULES%%
       {
         "rule_set": ["geoip-ru", "geosite-category-ru"],
         "outbound": "direct"

@@ -277,11 +277,42 @@ else
     echo "{\"profiles\":[{\"id\":\"$PROFILE_ID\",\"name\":\"$VLESS_PROFILE_NAME\",\"server\":\"$VLESS_SERVER\",\"server_port\":$VLESS_PORT,\"uuid\":\"$VLESS_UUID\",\"security\":\"$VLESS_SECURITY\",\"public_key\":\"$REALITY_PUBLIC_KEY\",\"short_id\":\"$REALITY_SHORT_ID\",\"sni\":\"$REALITY_SNI\",\"fingerprint\":\"$TLS_FINGERPRINT\",\"flow\":\"$VLESS_FLOW\",\"port_full_vpn\":$PORT_FULL,\"port_global_except_ru\":$PORT_GLOBAL}],\"default_profile_id\":\"$PROFILE_ID\",\"next_port\":12347,\"next_id\":2}" > "$PROFILES_FILE"
 fi
 
-# ===== 5. Generate sing-box configs from templates =====
-if [ -f "/etc/sing-box/config_full_vpn_${PROFILE_ID}.json" ]; then
-    log "sing-box configs already exist, skipping generation"
-else
-log "Generating sing-box configs for initial profile..."
+# ===== 5. Initialize custom rules (idempotent) =====
+CUSTOM_RULES_FILE="/etc/sing-box/custom_rules.json"
+[ -f "$CUSTOM_RULES_FILE" ] || echo '{"direct":[],"vpn":[]}' > "$CUSTOM_RULES_FILE"
+
+# ===== Custom rules builder =====
+build_custom_rules_file() {
+    local mode="$1" route_out="$2" dns_out="$3"
+    local rules_file="$CUSTOM_RULES_FILE"
+    > "$route_out"; > "$dns_out"
+    [ -f "$rules_file" ] || return 0
+
+    local direct=$(grep -o '"direct":\[[^]]*\]' "$rules_file" | sed 's/"direct":\[//;s/\]$//' | tr -d ' ')
+    local vpn=$(grep -o '"vpn":\[[^]]*\]' "$rules_file" | sed 's/"vpn":\[//;s/\]$//' | tr -d ' ')
+
+    case "$mode" in
+        global_except_ru)
+            [ -n "$direct" ] && {
+                echo "      {\"domain_suffix\":[$direct],\"outbound\":\"direct\"}," >> "$route_out"
+                echo "      {\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}," >> "$dns_out"
+            }
+            [ -n "$vpn" ] && {
+                echo "      {\"domain_suffix\":[$vpn],\"outbound\":\"vless-out\"}," >> "$route_out"
+                echo "      {\"domain_suffix\":[$vpn],\"server\":\"dns-remote\"}," >> "$dns_out"
+            }
+            ;;
+        full_vpn)
+            [ -n "$direct" ] && {
+                echo "      ,{\"domain_suffix\":[$direct],\"outbound\":\"direct\"}" >> "$route_out"
+                echo "      ,{\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}" >> "$dns_out"
+            }
+            ;;
+    esac
+}
+
+# ===== 6. Generate sing-box configs from templates =====
+log "Generating sing-box configs..."
 
 # Build security block (flow + tls) or empty for security=none
 SEC_FILE="/tmp/sb_sec_block_$$"
@@ -313,13 +344,18 @@ for mode in full_vpn global_except_ru; do
         full_vpn) listen_port="$PORT_FULL" ;;
         *) listen_port="$PORT_GLOBAL" ;;
     esac
+
+    cr_route="/tmp/sb_custom_route_$$"
+    cr_dns="/tmp/sb_custom_dns_$$"
+    build_custom_rules_file "$mode" "$cr_route" "$cr_dns"
+
     sed \
         -e "s|%%LISTEN_PORT%%|$listen_port|g" \
         -e "s|%%PROFILE_ID%%|$PROFILE_ID|g" \
         -e "s|%%VLESS_SERVER%%|$VLESS_SERVER|g" \
         -e "s|%%VLESS_PORT%%|$VLESS_PORT|g" \
         -e "s|%%VLESS_UUID%%|$VLESS_UUID|g" \
-        "$tpl" | awk -v secfile="$SEC_FILE" '
+        "$tpl" | awk -v secfile="$SEC_FILE" -v crroute="$cr_route" -v crdns="$cr_dns" '
         /%%VLESS_SECURITY_BLOCK%%/ {
             gsub(/%%VLESS_SECURITY_BLOCK%%/, "")
             printf "%s", $0
@@ -327,18 +363,28 @@ for mode in full_vpn global_except_ru; do
             close(secfile)
             next
         }
+        /%%CUSTOM_ROUTE_RULES%%/ {
+            while ((getline line < crroute) > 0) print line
+            close(crroute)
+            next
+        }
+        /%%CUSTOM_DNS_RULES%%/ {
+            while ((getline line < crdns) > 0) print line
+            close(crdns)
+            next
+        }
         { print }
         ' > "/etc/sing-box/config_${mode}_${PROFILE_ID}.json"
+    rm -f "$cr_route" "$cr_dns"
 done
 rm -f "$SEC_FILE"
-fi
 
-# ===== 6. Deploy sing-box init.d =====
+# ===== 7. Deploy sing-box init.d =====
 log "Deploying sing-box init.d script..."
 deploy "$SCRIPT_DIR/scripts/init.d/sing-box" /etc/init.d/sing-box
 chmod +x /etc/init.d/sing-box
 
-# ===== 7. Deploy update-rulesets script + cron =====
+# ===== 8. Deploy update-rulesets script + cron =====
 log "Deploying rule set update script..."
 deploy "$SCRIPT_DIR/scripts/update-rulesets.sh" /etc/sing-box/update-rulesets.sh
 chmod +x /etc/sing-box/update-rulesets.sh
@@ -347,7 +393,7 @@ chmod +x /etc/sing-box/update-rulesets.sh
 CRON_LINE="0 4 * * 1 /etc/sing-box/update-rulesets.sh"
 (crontab -l 2>/dev/null | grep -v "update-rulesets.sh"; echo "$CRON_LINE") | crontab -
 
-# ===== 8. Deploy zapret config and hostlist =====
+# ===== 9. Deploy zapret config and hostlist =====
 if [ "$SETUP_MODE" != "vpn-only" ]; then
     log "Deploying zapret config..."
     deploy "$SCRIPT_DIR/configs/zapret/config" "$ZAPRET_DIR/config"
@@ -355,7 +401,7 @@ if [ "$SETUP_MODE" != "vpn-only" ]; then
     deploy "$SCRIPT_DIR/configs/zapret/zapret-hosts-user.txt" "$ZAPRET_DIR/ipset/zapret-hosts-user.txt"
 fi
 
-# ===== 9. Zapret symlinks =====
+# ===== 10. Zapret symlinks =====
 if [ "$SETUP_MODE" != "vpn-only" ]; then
     log "Setting up zapret symlinks..."
     if [ -f "$ZAPRET_DIR/init.d/sysv/zapret2" ]; then
@@ -374,7 +420,7 @@ if [ "$SETUP_MODE" != "vpn-only" ]; then
         ln -sf "$ZAPRET_DIR/init.d/openwrt/90-zapret2" /etc/hotplug.d/iface/90-zapret2
 fi
 
-# ===== 10. Deploy CGI panel =====
+# ===== 11. Deploy CGI panel =====
 log "Deploying web control panel..."
 mkdir -p /www/cgi-bin
 deploy "$SCRIPT_DIR/scripts/cgi-bin/vpn" /www/cgi-bin/vpn
@@ -384,13 +430,13 @@ chmod +x /www/cgi-bin/vpn
 [ -f /etc/vpn_state.json ] || echo '{}' > /etc/vpn_state.json
 [ -f /etc/device_names.json ] || echo '{}' > /etc/device_names.json
 
-# ===== 11. Setup nftables + ip rule =====
+# ===== 12. Setup nftables + ip rule =====
 log "Setting up nftables and ip rule..."
 deploy "$SCRIPT_DIR/configs/nftables/proxy-tproxy.sh" /etc/proxy-tproxy.sh
 chmod +x /etc/proxy-tproxy.sh
 sh /etc/proxy-tproxy.sh
 
-# ===== 12. Configure Wi-Fi =====
+# ===== 13. Configure Wi-Fi =====
 log "Configuring Wi-Fi..."
 
 # Detect radio bands dynamically (supports 2/3+ radio devices like GL-MT6000)
@@ -418,14 +464,14 @@ uci set "wireless.default_$RADIO_5.key=$WIFI_PASSWORD"
 
 uci commit wireless
 
-# ===== 13. Configure uhttpd for CGI =====
+# ===== 14. Configure uhttpd for CGI =====
 log "Configuring uhttpd..."
 # Remove duplicate cgi_prefix entries, then add once
 uci delete uhttpd.main.cgi_prefix 2>/dev/null || true
 uci add_list uhttpd.main.cgi_prefix='/cgi-bin'
 uci commit uhttpd
 
-# ===== 14. Create boot script for nftables/ip rule =====
+# ===== 15. Create boot script for nftables/ip rule =====
 log "Creating boot autostart script..."
 cat > /etc/init.d/proxy-routing <<'INITEOF'
 #!/bin/sh /etc/rc.common
@@ -578,7 +624,7 @@ add_catchall() {
 INITEOF
 chmod +x /etc/init.d/proxy-routing
 
-# ===== 15. Enable and start services =====
+# ===== 16. Enable and start services =====
 log "Enabling and starting services..."
 
 /etc/init.d/proxy-routing enable

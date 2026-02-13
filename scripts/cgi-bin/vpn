@@ -9,9 +9,12 @@ TEMPLATES_DIR="/etc/sing-box/templates"
 LAN_IFACE=$(cat /etc/vpn_lan_iface 2>/dev/null || echo "br-lan")
 ROUTER_IP=$(uci get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
 
+CUSTOM_RULES_FILE="/etc/sing-box/custom_rules.json"
+
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 [ -f "$NAMES_FILE" ] || echo '{}' > "$NAMES_FILE"
 [ -f "$PROFILES_FILE" ] || echo '{"profiles":[],"default_profile_id":"","next_port":12345,"next_id":1}' > "$PROFILES_FILE"
+[ -f "$CUSTOM_RULES_FILE" ] || echo '{"direct":[],"vpn":[]}' > "$CUSTOM_RULES_FILE"
 
 # ===== Profile helpers =====
 
@@ -42,6 +45,69 @@ get_profile_ids() {
     grep -o '"id":"[^"]*"' "$PROFILES_FILE" | sed 's/"id":"//;s/"//'
 }
 
+# ===== Custom rules helpers =====
+
+add_custom_rule() {
+    local domain="$1" direction="$2"
+    local current=$(grep -o "\"$direction\":\[[^]]*\]" "$CUSTOM_RULES_FILE" | sed "s/\"$direction\":\[//;s/\]$//")
+    echo "$current" | grep -q "\"$domain\"" && return 0
+    if [ -z "$current" ]; then new="\"$domain\""; else new="${current},\"$domain\""; fi
+    sed -i "s|\"$direction\":\[[^]]*\]|\"$direction\":[$new]|" "$CUSTOM_RULES_FILE"
+}
+
+delete_custom_rule() {
+    local domain="$1" direction="$2"
+    sed -i "s|,\"$domain\"||g; s|\"$domain\",||g; s|\"$domain\"||g" "$CUSTOM_RULES_FILE"
+}
+
+build_custom_rules_file() {
+    local mode="$1" route_out="$2" dns_out="$3"
+    local rules_file="$CUSTOM_RULES_FILE"
+    > "$route_out"; > "$dns_out"
+    [ -f "$rules_file" ] || return 0
+
+    local direct=$(grep -o '"direct":\[[^]]*\]' "$rules_file" | sed 's/"direct":\[//;s/\]$//' | tr -d ' ')
+    local vpn=$(grep -o '"vpn":\[[^]]*\]' "$rules_file" | sed 's/"vpn":\[//;s/\]$//' | tr -d ' ')
+
+    case "$mode" in
+        global_except_ru)
+            [ -n "$direct" ] && {
+                echo "      {\"domain_suffix\":[$direct],\"outbound\":\"direct\"}," >> "$route_out"
+                echo "      {\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}," >> "$dns_out"
+            }
+            [ -n "$vpn" ] && {
+                echo "      {\"domain_suffix\":[$vpn],\"outbound\":\"vless-out\"}," >> "$route_out"
+                echo "      {\"domain_suffix\":[$vpn],\"server\":\"dns-remote\"}," >> "$dns_out"
+            }
+            ;;
+        full_vpn)
+            [ -n "$direct" ] && {
+                echo "      ,{\"domain_suffix\":[$direct],\"outbound\":\"direct\"}" >> "$route_out"
+                echo "      ,{\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}" >> "$dns_out"
+            }
+            ;;
+    esac
+}
+
+regenerate_all_configs() {
+    get_profile_ids | while read pid; do
+        local server=$(get_profile_field "$pid" "server")
+        local server_port=$(grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o '"server_port":[0-9]*' | head -1 | sed 's/"server_port"://')
+        local uuid=$(get_profile_field "$pid" "uuid")
+        local pbk=$(get_profile_field "$pid" "public_key")
+        local sid=$(get_profile_field "$pid" "short_id")
+        local sni=$(get_profile_field "$pid" "sni")
+        local fp=$(get_profile_field "$pid" "fingerprint")
+        local flow=$(get_profile_field "$pid" "flow")
+        local security=$(get_profile_field "$pid" "security")
+        local port_full=$(get_profile_port "$pid" "full_vpn")
+        local port_global=$(get_profile_port "$pid" "global_except_ru")
+        generate_configs "$pid" "$port_full" "$port_global" \
+            "$server" "$server_port" "$uuid" "$pbk" "$sid" "$sni" "$fp" "$flow" "$security"
+    done
+    /etc/init.d/sing-box restart 2>/dev/null
+}
+
 # Build VPN_SERVERS exclusion string from all profiles
 ALL_SERVERS=$(get_all_servers)
 if [ -n "$ALL_SERVERS" ]; then
@@ -70,7 +136,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 fi
 
 # Parse query string
-action="" ; mac="" ; name="" ; preset="" ; vless_uri="" ; profile_id=""
+action="" ; mac="" ; name="" ; preset="" ; vless_uri="" ; profile_id="" ; rule_domain="" ; rule_action=""
 IFS='&' ; set -- $QUERY_STRING
 for param; do
     key="${param%%=*}"
@@ -82,6 +148,8 @@ for param; do
         preset) preset="$val" ;;
         vless_uri) vless_uri="$(echo "$val" | sed 's/%3A/:/g; s/%3a/:/g; s/%40/@/g; s/%3F/?/g; s/%3f/?/g; s/%23/#/g; s/%26/\&/g; s/%3D/=/g; s/%3d/=/g; s/%2F/\//g; s/%2f/\//g; s/+/ /g')" ;;
         profile_id) profile_id="$val" ;;
+        rule_domain) rule_domain="$(echo "$val" | sed 's/+/ /g; s/%2F/\//g; s/%2f/\//g' | tr -d ' ')" ;;
+        rule_action) rule_action="$val" ;;
     esac
 done
 unset IFS
@@ -201,13 +269,18 @@ SECEOF
             full_vpn) listen_port="$port_full" ;;
             *) listen_port="$port_global" ;;
         esac
+
+        local cr_route="/tmp/sb_custom_route_$$"
+        local cr_dns="/tmp/sb_custom_dns_$$"
+        build_custom_rules_file "$mode" "$cr_route" "$cr_dns"
+
         sed \
             -e "s|%%LISTEN_PORT%%|$listen_port|g" \
             -e "s|%%PROFILE_ID%%|$pid|g" \
             -e "s|%%VLESS_SERVER%%|$server|g" \
             -e "s|%%VLESS_PORT%%|$server_port|g" \
             -e "s|%%VLESS_UUID%%|$uuid|g" \
-            "$tpl" | awk -v secfile="$sec_file" '
+            "$tpl" | awk -v secfile="$sec_file" -v crroute="$cr_route" -v crdns="$cr_dns" '
             /%%VLESS_SECURITY_BLOCK%%/ {
                 gsub(/%%VLESS_SECURITY_BLOCK%%/, "")
                 printf "%s", $0
@@ -215,8 +288,19 @@ SECEOF
                 close(secfile)
                 next
             }
+            /%%CUSTOM_ROUTE_RULES%%/ {
+                while ((getline line < crroute) > 0) print line
+                close(crroute)
+                next
+            }
+            /%%CUSTOM_DNS_RULES%%/ {
+                while ((getline line < crdns) > 0) print line
+                close(crdns)
+                next
+            }
             { print }
             ' > "/etc/sing-box/config_${mode}_${pid}.json"
+        rm -f "$cr_route" "$cr_dns"
     done
     rm -f "$sec_file"
 }
@@ -505,6 +589,29 @@ do_set_default_profile() {
 # ===== Handle actions =====
 
 case "$action" in
+    add_rule)
+        if [ -n "$rule_domain" ] && echo "$rule_action" | grep -qE '^(direct|vpn)$'; then
+            # Validate domain: letters, digits, dots, hyphens only
+            if echo "$rule_domain" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$'; then
+                add_custom_rule "$rule_domain" "$rule_action"
+                regenerate_all_configs
+            fi
+        fi
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
+    delete_rule)
+        if [ -n "$rule_domain" ] && echo "$rule_action" | grep -qE '^(direct|vpn)$'; then
+            delete_custom_rule "$rule_domain" "$rule_action"
+            regenerate_all_configs
+        fi
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
     add_profile)
         do_add_profile "$vless_uri"
         echo "Status: 302 Found"
@@ -638,6 +745,7 @@ case "$QUERY_STRING" in
     *err=invalid_uri*) err="Invalid vless:// URI" ;;
     *err=max_profiles*) err="Maximum 4 profiles reached" ;;
     *err=last_profile*) err="Cannot delete the last profile" ;;
+    *err=invalid_domain*) err="Invalid domain name" ;;
 esac
 
 # --- HTML output ---
@@ -818,6 +926,43 @@ EOF
 done
 
 echo "</div>"
+
+# ===== Custom Routes section =====
+cat <<'CUSTOMHEAD'
+<div class="section">
+<h2>Custom Routes</h2>
+CUSTOMHEAD
+
+# Show existing rules
+direct_domains=$(grep -o '"direct":\[[^]]*\]' "$CUSTOM_RULES_FILE" 2>/dev/null | sed 's/"direct":\[//;s/\]$//' | tr -d ' ')
+vpn_domains=$(grep -o '"vpn":\[[^]]*\]' "$CUSTOM_RULES_FILE" 2>/dev/null | sed 's/"vpn":\[//;s/\]$//' | tr -d ' ')
+
+has_rules=""
+echo "$direct_domains" | tr ',' '\n' | tr -d '"' | while read d; do
+    [ -z "$d" ] && continue
+    enc_d=$(echo "$d" | sed 's/ /%20/g')
+    echo "<div class=\"profile-card\"><div class=\"profile-info\"><span class=\"profile-name\">${d}</span> <span style=\"color:#00c853;font-size:.8em\">DIRECT</span></div><div class=\"profile-actions\"><a class=\"btn btn-sm btn-danger\" href=\"?action=delete_rule&rule_domain=${enc_d}&rule_action=direct\">Delete</a></div></div>"
+done
+
+echo "$vpn_domains" | tr ',' '\n' | tr -d '"' | while read d; do
+    [ -z "$d" ] && continue
+    enc_d=$(echo "$d" | sed 's/ /%20/g')
+    echo "<div class=\"profile-card\"><div class=\"profile-info\"><span class=\"profile-name\">${d}</span> <span style=\"color:#00d2ff;font-size:.8em\">VPN</span></div><div class=\"profile-actions\"><a class=\"btn btn-sm btn-danger\" href=\"?action=delete_rule&rule_domain=${enc_d}&rule_action=vpn\">Delete</a></div></div>"
+done
+
+cat <<'CUSTOMFORM'
+<form class="add-form" method="POST" action="/cgi-bin/vpn" style="margin-top:10px">
+<input type="hidden" name="action" value="add_rule">
+<input class="add-input" type="text" name="rule_domain" placeholder="example.com" required style="flex:1;min-width:180px">
+<select class="preset-select" name="rule_action">
+<option value="direct">Direct (bypass VPN)</option>
+<option value="vpn">VPN (force through VPN)</option>
+</select>
+<button class="add-btn" type="submit">Add Rule</button>
+</form>
+<div style="color:#666;font-size:.75em;margin-top:6px">* covers the domain and all its subdomains</div>
+</div>
+CUSTOMFORM
 
 # ===== Add device section =====
 cat <<'ADDDEVICE'
