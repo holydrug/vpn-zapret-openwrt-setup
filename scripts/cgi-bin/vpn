@@ -436,6 +436,19 @@ rebuild_catchall() {
         meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
 
     nft add rule inet proxy_route forward_zapret iifname "$LAN_IFACE" return 2>/dev/null
+
+    # Re-apply kill switch so it stays at the very end of the chain
+    if [ "$(cat /etc/vpn_killswitch 2>/dev/null)" = "1" ]; then
+        nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
+            grep 'comment "killswitch"' | grep -oE 'handle [0-9]+' | \
+            awk '{print $2}' | while read h; do
+                nft delete rule ip proxy_tproxy prerouting handle "$h" 2>/dev/null
+            done
+        nft add rule ip proxy_tproxy prerouting \
+            iifname "$LAN_IFACE" \
+            ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16 }" \
+            drop comment '"killswitch"' 2>/dev/null
+    fi
 }
 
 # Auto-update default profile when no devices remain on current default

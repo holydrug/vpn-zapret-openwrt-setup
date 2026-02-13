@@ -620,6 +620,15 @@ add_catchall() {
     # Catch-all: zapret OFF for unknown devices
     nft add rule inet proxy_route forward_zapret iifname "$LAN_IFACE" return 2>/dev/null
     logger -t proxy-routing "Catch-all zapret OFF (return) enabled"
+
+    # Restore kill switch at the very end of the chain
+    if [ "$(cat /etc/vpn_killswitch 2>/dev/null)" = "1" ]; then
+        nft add rule ip proxy_tproxy prerouting \
+            iifname "$LAN_IFACE" \
+            ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16 }" \
+            drop comment '"killswitch"' 2>/dev/null
+        logger -t proxy-routing "Kill switch restored"
+    fi
 }
 INITEOF
 chmod +x /etc/init.d/proxy-routing
