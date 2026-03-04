@@ -43,6 +43,13 @@ start_service() {
     ip rule add fwmark 1 lookup 100
     ip route replace local 0.0.0.0/0 dev lo table 100
 
+    # Bypass tproxy for router own WAN IP (enables hairpin NAT for port forwards)
+    WAN_IP=$(ifstatus wan | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+    [ -n "$WAN_IP" ] && {
+        nft insert rule ip proxy_tproxy prerouting ip daddr "$WAN_IP" accept 2>/dev/null
+        logger -t proxy-routing "Bypassing tproxy for WAN IP $WAN_IP (hairpin NAT)"
+    }
+
     # DHCP must bypass tproxy (broadcast 255.255.255.255 not in excluded ranges)
     nft insert rule ip proxy_tproxy prerouting iifname "$LAN_IFACE" udp dport '{ 67, 68 }' accept 2>/dev/null
 
