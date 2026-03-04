@@ -297,29 +297,33 @@ migrate_dns() {
         return 1
     fi
 
-    # Step 2: move dnsmasq to port 5353
-    log "Moving dnsmasq to port 5353..."
-    uci set dhcp.@dnsmasq[0].port=5353
-    uci commit dhcp
-    /etc/init.d/dnsmasq restart
-
-    # Step 3: start AdGuard Home (binds to :53)
-    log "Starting AdGuard Home..."
+    # Step 2: enable AGH (don't start yet — dnsmasq still holds :53)
     /etc/init.d/adguardhome enable
+
+    # Step 3: atomic swap — stop dnsmasq, start AGH, restart dnsmasq on :5353
+    # This minimizes the window where nothing listens on :53
+    log "Swapping DNS: dnsmasq :53 -> AGH :53 + dnsmasq :5353..."
+    /etc/init.d/dnsmasq stop
     /etc/init.d/adguardhome start
 
-    # Step 4: poll for :53 listener (up to 3s)
+    # Poll for AGH to bind :53 (up to 5s)
     local tries=0
     while [ "$tries" -lt 5 ]; do
-        if netstat -tlnp 2>/dev/null | grep -q ':53 ' || \
-           ss -tlnp 2>/dev/null | grep -q ':53 '; then
+        if netstat -tlnp 2>/dev/null | grep 'AdGuard' | grep -q ':53 ' || \
+           netstat -ulnp 2>/dev/null | grep 'AdGuard' | grep -q ':53 '; then
             break
         fi
         sleep 1
         tries=$((tries + 1))
     done
 
-    # Step 5: verify DNS
+    # Now move dnsmasq to :5353 and restart (AGH upstreams to it)
+    uci set dhcp.@dnsmasq[0].port=5353
+    uci commit dhcp
+    /etc/init.d/dnsmasq start
+
+    # Step 4: verify DNS end-to-end
+    sleep 1
     if check_dns "post-migration"; then
         log "DNS migration successful!"
         echo "1" > /etc/vpn_agh_installed
